@@ -50,6 +50,16 @@ class Plugin extends \Sabre\CalDAV\Schedule\Plugin {
 	/** @var string|null */
 	private $pathOfCalendarObjectChange = null;
 
+	/**
+	 * Whether an attendee's REPLY is currently being fanned out to the other attendees
+	 *
+	 * TODO: Remove this workaround (the flag, the deliver() override and the
+	 * fan-out window in scheduleLocalDelivery()) once sabre/vobject treats
+	 * participation-only overrides as insignificant and is vendored in
+	 * 3rdparty, and TipBroker no longer hardcodes significantChange.
+	 */
+	private bool $replyFanOut = false;
+
 	public const CALENDAR_USER_TYPE = '{' . self::NS_CALDAV . '}calendar-user-type';
 	public const SCHEDULE_DEFAULT_CALENDAR_URL = '{' . Plugin::NS_CALDAV . '}schedule-default-calendar-URL';
 
@@ -253,6 +263,23 @@ class Plugin extends \Sabre\CalDAV\Schedule\Plugin {
 	 * @inheritDoc
 	 */
 	#[\Override]
+	public function deliver(ITip\Message $iTipMessage): void {
+		// A REQUEST fanned out for a REPLY only relays the replier's new
+		// participation status, as TipBroker::processMessageReply() alters
+		// nothing but PARTSTAT, SCHEDULE-STATUS and RSVP: local delivery
+		// ignores the significance flag and still syncs the attendee copies,
+		// while mail transports skip insignificant messages
+		// TODO: Remove together with $replyFanOut, see its TODO for the conditions
+		if ($this->replyFanOut && $this->hasMethod($iTipMessage, 'REQUEST')) {
+			$iTipMessage->significantChange = false;
+		}
+		parent::deliver($iTipMessage);
+	}
+
+	/**
+	 * @inheritDoc
+	 */
+	#[\Override]
 	public function scheduleLocalDelivery(ITip\Message $iTipMessage):void {
 		/** @var VEvent|null $vevent */
 		$vevent = $iTipMessage->message->VEVENT ?? null;
@@ -262,7 +289,19 @@ class Plugin extends \Sabre\CalDAV\Schedule\Plugin {
 			$vevent->remove('VALARM');
 		}
 
-		parent::scheduleLocalDelivery($iTipMessage);
+		if ($this->hasMethod($iTipMessage, 'REPLY')) {
+			// the parent re-brokers the organizer's event while delivering a
+			// REPLY, fanning REQUEST messages out to the other attendees
+			// TODO: Remove the fan-out window together with $replyFanOut, see its TODO
+			$this->replyFanOut = true;
+			try {
+				parent::scheduleLocalDelivery($iTipMessage);
+			} finally {
+				$this->replyFanOut = false;
+			}
+		} else {
+			parent::scheduleLocalDelivery($iTipMessage);
+		}
 		// We only care when the message was successfully delivered locally
 		// Log all possible codes returned from the parent method that mean something went wrong
 		// 3.7, 3.8, 5.0, 5.2
@@ -272,7 +311,7 @@ class Plugin extends \Sabre\CalDAV\Schedule\Plugin {
 		}
 		// We only care about request. reply and cancel are properly handled
 		// by parent::scheduleLocalDelivery already
-		if (strcasecmp($iTipMessage->method, 'REQUEST') !== 0) {
+		if (!$this->hasMethod($iTipMessage, 'REQUEST')) {
 			return;
 		}
 
@@ -362,6 +401,14 @@ EOF;
 		// was not yet created. Hence Sabre/DAV won't find a calendar-object, when we
 		// send our reply.
 		$this->schedulingResponses[] = $responseITipMessage;
+	}
+
+	/**
+	 * iTip methods are compared case-insensitively as not all producers
+	 * upper-case them.
+	 */
+	private function hasMethod(ITip\Message $iTipMessage, string $method): bool {
+		return strcasecmp((string)$iTipMessage->method, $method) === 0;
 	}
 
 	/**

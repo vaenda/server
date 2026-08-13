@@ -768,4 +768,104 @@ class PluginTest extends TestCase {
 			$newFlag
 		);
 	}
+
+	// TODO: Remove the fan-out tests below together with the $replyFanOut workaround in Plugin.php
+	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'deliverSignificanceProvider')]
+	public function testDeliverSignificance(bool $duringReplyFanOut, string $method, bool $expectedSignificant): void {
+		$message = new Message();
+		$message->method = $method;
+		$message->significantChange = true;
+		$message->scheduleStatus = '1.2;Message delivered locally';
+
+		if ($duringReplyFanOut) {
+			$this->deliverDuringReplyFanOut(function () use ($message): void {
+				$this->plugin->deliver($message);
+			});
+		} else {
+			$this->plugin->deliver($message);
+		}
+
+		$this->assertSame($expectedSignificant, $message->significantChange);
+	}
+
+	public static function deliverSignificanceProvider(): array {
+		return [
+			'request outside fan-out' => [false, 'REQUEST', true],
+			'request during fan-out' => [true, 'REQUEST', false],
+			'lowercase request during fan-out' => [true, 'request', false],
+			'reply during fan-out' => [true, 'REPLY', true],
+			'cancel during fan-out' => [true, 'CANCEL', true],
+		];
+	}
+
+	/**
+	 * Delivering a fan-out message triggers nested scheduleLocalDelivery runs
+	 * for local recipients - those must not end the fan-out window early.
+	 */
+	public function testDeliverKeepsFanOutWindowAcrossNestedDeliveries(): void {
+		$nested = new Message();
+		$nested->method = 'REQUEST';
+		$nested->message = new VCalendar();
+		$this->server->method('emit')
+			->willReturnCallback(function () use ($nested): bool {
+				$this->plugin->scheduleLocalDelivery($nested);
+				return true;
+			});
+
+		$first = new Message();
+		$first->method = 'REQUEST';
+		$first->significantChange = true;
+		$first->scheduleStatus = '1.2;Message delivered locally';
+
+		$second = new Message();
+		$second->method = 'REQUEST';
+		$second->significantChange = true;
+		$second->scheduleStatus = '1.2;Message delivered locally';
+
+		$this->deliverDuringReplyFanOut(function () use ($first, $second): void {
+			$this->plugin->deliver($first);
+			$this->plugin->deliver($second);
+		});
+
+		$this->assertFalse($first->significantChange);
+		$this->assertFalse($second->significantChange, 'nested deliveries must not end the fan-out window');
+	}
+
+	public function testScheduleLocalDeliveryClosesReplyFanOutWindow(): void {
+		$reply = new Message();
+		$reply->method = 'REPLY';
+		$reply->message = new VCalendar();
+		$this->plugin->scheduleLocalDelivery($reply);
+
+		$request = new Message();
+		$request->method = 'REQUEST';
+		$request->significantChange = true;
+		$request->scheduleStatus = '1.2;Message delivered locally';
+		$this->plugin->deliver($request);
+
+		$this->assertTrue($request->significantChange, 'the fan-out window must close with the reply');
+	}
+
+	/**
+	 * Runs the callback while a REPLY is being processed: fetching the ACL
+	 * plugin is the first thing the parent does inside the fan-out window, so
+	 * deliveries made from the callback happen mid-fan-out. Returning no ACL
+	 * plugin makes the parent return right afterwards.
+	 */
+	private function deliverDuringReplyFanOut(callable $callback): void {
+		$invoked = false;
+		$this->server->method('getPlugin')
+			->willReturnCallback(function () use (&$invoked, $callback) {
+				if (!$invoked) {
+					$invoked = true;
+					$callback();
+				}
+				return null;
+			});
+
+		$reply = new Message();
+		$reply->method = 'REPLY';
+		$reply->message = new VCalendar();
+		$this->plugin->scheduleLocalDelivery($reply);
+	}
 }
